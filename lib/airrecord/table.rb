@@ -1,14 +1,31 @@
 require 'rubygems' # For Gem::Version
 
 module Airrecord
+  MAX_BATCH_LIMIT = 10
+  MAX_CHUNKS_LIMIT = 5
+
   class Table
     class << self
-      attr_accessor :base_key, :table_name
+      attr_accessor :base_key, :table_name, :batch_limit
       attr_writer :api_key
 
       def client
         @@clients ||= {}
         @@clients[api_key] ||= Client.new(api_key)
+      end
+
+      def batch_limit
+        fallback = defined?(Airrecord.batch_limit) ? Airrecord.batch_limit : MAX_BATCH_LIMIT
+        defined?(@batch_limit) ? @batch_limit : fallback
+      end
+
+      def batch_limit=(limit = MAX_BATCH_LIMIT)
+        @batch_limit = if !limit.is_a?(Integer) || limit > MAX_BATCH_LIMIT
+                         warn "Airreccord: We have set the value to the maximum batch size allowed, #{MAX_BATCH_LIMIT}."
+                         MAX_BATCH_LIMIT
+                       else
+                         limit
+                       end
       end
 
       def api_key
@@ -51,7 +68,7 @@ module Airrecord
       def find_many(ids)
         return [] if ids.empty?
 
-        or_args = ids.map { |id| "RECORD_ID() = '#{id}'"}.join(',')
+        or_args = ids.map { |id| "RECORD_ID() = '#{id}'" }.join(',')
         formula = "OR(#{or_args})"
         records(filter: formula).sort_by { |record| or_args.index(record.id) }
       end
@@ -75,6 +92,35 @@ module Airrecord
 
       def create(fields, options = {})
         new(fields).tap { |record| record.save(options) }
+      end
+
+      def batch_create(records, options = {}, typecast: false)
+        raise TypeError, 'The records must be an Array' unless records.is_a? Array
+
+        chunks = records.each_slice(batch_limit).to_a
+
+        if chunks.size > MAX_CHUNKS_LIMIT
+          raise Error, "There are too many chunks, so they might block your requests. Max allowed: #{MAX_CHUNKS_LIMIT}"
+        end
+
+        path = "/v0/#{base_key}/#{client.escape(table_name)}"
+
+        chunks.each do |chunk|
+          serialized_chunks = chunk.map { |record| { fields: record } }
+
+          body = {
+            records: serialized_chunks,
+            **options,
+            typecast: typecast
+          }.to_json
+
+          response = client.connection.post(path, body, { 'Content-Type' => 'application/json' })
+          parsed_response = client.parse(response.body)
+
+          return client.handle_error(response.status, parsed_response) unless response.success?
+        end
+
+        true
       end
 
       def records(filter: nil, sort: nil, view: nil, offset: nil, paginate: true, fields: nil, max_records: nil, page_size: nil)
@@ -245,11 +291,12 @@ module Airrecord
     end
   end
 
-  def self.table(api_key, base_key, table_name)
+  def self.table(api_key, base_key, table_name, batch_limit: MAX_BATCH_LIMIT)
     Class.new(Table) do |klass|
       klass.table_name = table_name
       klass.api_key = api_key
       klass.base_key = base_key
+      klass.batch_limit = batch_limit
     end
   end
 end
